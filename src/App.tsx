@@ -3,13 +3,13 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ScatterChart, Scatter, ReferenceLine
 } from 'recharts';
 import {
-  Calculator, Upload, Download, Home, Trash2, Plus, AlertCircle, FileSpreadsheet
+  Calculator, Upload, Download, Home, Trash2, Plus, AlertCircle, FileSpreadsheet, Save, FolderOpen, X
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, type User } from 'firebase/auth';
 import {
   getFirestore, doc, onSnapshot, setDoc, collection, addDoc,
-  updateDoc, deleteDoc, query, orderBy
+  updateDoc, deleteDoc, query, orderBy, getDocs
 } from 'firebase/firestore';
 import clsx from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -59,6 +59,14 @@ interface Comparable {
   surfaceType: SurfaceType;
   homogenizationFactor: number;
   daysOnMarket: number;
+}
+
+interface SavedValuation {
+  id: string;
+  name: string;
+  date: number; // Timestamp
+  target: TargetProperty;
+  comparables: Comparable[];
 }
 
 // --- Constants & Helpers ---
@@ -120,15 +128,12 @@ const StatCard = ({ label, value, subtext, color = "blue" }: { label: string, va
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
+  // const [loading, setLoading] = useState(true); // Removed blocking loading
+  // const [loading, setLoading] = useState(true); // Removed blocking loading
+  // const [loading, setLoading] = useState(true); // Removed blocking loading
+  const addLog = (msg: string) => console.log(`${new Date().toLocaleTimeString()}: ${msg}`);
 
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-      </div>
-    );
-  }
+  // if (loading) { ... } // Removed blocking UI
 
   // State
   const [target, setTarget] = useState<TargetProperty>({
@@ -140,8 +145,10 @@ function App() {
   });
 
   const [comparables, setComparables] = useState<Comparable[]>([]);
-  const [importModalOpen, setImportModalOpen] = useState(false);
-  const [csvText, setCsvText] = useState('');
+  const [savedValuations, setSavedValuations] = useState<SavedValuation[]>([]);
+  const [savedValuationsModalOpen, setSavedValuationsModalOpen] = useState(false);
+  // const [importModalOpen, setImportModalOpen] = useState(false);
+  // const [csvText, setCsvText] = useState('');
 
   // --- Effects ---
 
@@ -151,17 +158,18 @@ function App() {
       if (u) {
         setUser(u);
       } else {
-        signInAnonymously(auth).catch(console.error);
+        signInAnonymously(auth).catch((error) => {
+          console.error("Auth error:", error);
+          alert(`Authentication failed: ${error.message}`);
+        });
       }
     });
     return unsubscribe;
   }, []);
 
   useEffect(() => {
-    if (!user || !db) {
-      setLoading(false);
-      return;
-    }
+    if (!user) return;
+    if (!db) return;
 
     const targetRef = doc(db, `artifacts/tasadorpro/users/${user.uid}/data/valuation_active`);
     const comparablesRef = collection(db, `artifacts/tasadorpro/users/${user.uid}/comparables`);
@@ -171,6 +179,8 @@ function App() {
       if (doc.exists()) {
         setTarget(doc.data() as TargetProperty);
       }
+    }, (error) => {
+      console.error("Error syncing target:", error);
     });
 
     // Sync Comparables
@@ -178,12 +188,23 @@ function App() {
     const unsubComparables = onSnapshot(q, (snapshot) => {
       const comps = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Comparable));
       setComparables(comps);
-      setLoading(false);
+    }, (error) => {
+      console.error("Error syncing comparables:", error);
+      alert(`Error connecting to database: ${error.message}`);
+    });
+
+    // Sync Saved Valuations
+    const savedRef = collection(db, `artifacts/tasadorpro/users/${user.uid}/saved_valuations`);
+    const qSaved = query(savedRef, orderBy('date', 'desc'));
+    const unsubSaved = onSnapshot(qSaved, (snapshot) => {
+      const saved = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as SavedValuation));
+      setSavedValuations(saved);
     });
 
     return () => {
       unsubTarget();
       unsubComparables();
+      unsubSaved();
     };
   }, [user]);
 
@@ -230,71 +251,273 @@ function App() {
       setComparables(comparables.filter(c => c.id !== id));
     }
   };
+  // --- Google Sheets Integration ---
 
-  const handleImportCSV = () => {
-    Papa.parse(csvText, {
-      header: false,
-      skipEmptyLines: true,
-      complete: async (results) => {
-        const rows = results.data as string[][];
-        // Expected: [Ignorar, Dirección, Precio, SupCub, SupDesc, Tipo, Factor, Días]
-        // Index:    0        1          2       3       4        5     6       7
+  const [sheetUrl, setSheetUrl] = useState('');
 
-        const newComps: Omit<Comparable, 'id'>[] = [];
-
-        for (const row of rows) {
-          if (row.length < 8) continue; // Skip invalid
-
-          const typeRaw = row[5]?.trim();
-          const type = SURFACE_TYPES.includes(typeRaw as any) ? (typeRaw as SurfaceType) : 'Ninguno';
-          const factorRaw = parseFloat(row[6]);
-          const factor = !isNaN(factorRaw) ? factorRaw : DEFAULT_FACTORS[type];
-
-          newComps.push({
-            address: row[1] || 'Sin dirección',
-            price: parseFloat(row[2]) || 0,
-            coveredSurface: parseFloat(row[3]) || 0,
-            uncoveredSurface: parseFloat(row[4]) || 0,
-            surfaceType: type,
-            homogenizationFactor: factor,
-            daysOnMarket: parseInt(row[7]) || 0
-          });
-        }
-
-        // Batch add (or sequential if batch not supported easily in this context without batch obj)
-        if (user && db) {
-          for (const c of newComps) {
-            await addDoc(collection(db, `artifacts/tasadorpro/users/${user.uid}/comparables`), c);
-          }
-        } else {
-          setComparables([...comparables, ...newComps.map(c => ({ ...c, id: Math.random().toString() }))]);
-        }
-        setImportModalOpen(false);
-        setCsvText('');
+  const getSheetCsvUrl = (url: string) => {
+    try {
+      // Handle standard edit URLs
+      // https://docs.google.com/spreadsheets/d/DOC_ID/edit...
+      const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
+      if (match && match[1]) {
+        // Use Google Visualization API endpoint for better CORS support
+        return `https://docs.google.com/spreadsheets/d/${match[1]}/gviz/tq?tqx=out:csv`;
       }
-    });
+      return null;
+    } catch (e) {
+      return null;
+    }
   };
 
-  const handleExportCSV = () => {
-    const data = comparables.map(c => [
-      '', // Ignorar
-      c.address,
-      c.price,
-      c.coveredSurface,
-      c.uncoveredSurface,
-      c.surfaceType,
-      c.homogenizationFactor,
-      c.daysOnMarket
-    ]);
-    const csv = Papa.unparse(data);
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', 'tasador_pro_export.csv');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  const handleImportFromSheet = async () => {
+    if (!sheetUrl) {
+      alert("Por favor ingresa el link de tu Google Sheet (debe ser público).");
+      return;
+    }
+
+    const csvUrl = getSheetCsvUrl(sheetUrl);
+    if (!csvUrl) {
+      alert("Link inválido. Asegúrate de copiar el link completo de tu Google Sheet.");
+      return;
+    }
+
+    try {
+      addLog("Fetching data from Google Sheet...");
+      // Add timestamp to prevent caching
+      const urlWithCacheBuster = `${csvUrl}&t=${Date.now()}`;
+      const response = await fetch(urlWithCacheBuster);
+      if (!response.ok) throw new Error("Failed to fetch sheet");
+      const text = await response.text();
+
+      // Debug log
+      console.log("CSV Text Preview:", text.substring(0, 200));
+
+      Papa.parse(text, {
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: (h) => h.trim(),
+        complete: async (results) => {
+          try {
+            const rows = results.data as any[];
+            if (rows.length > 0) {
+              console.log("First row raw:", rows[0]);
+              console.log("Headers found:", Object.keys(rows[0]));
+            }
+            const newComps: Omit<Comparable, 'id'>[] = [];
+
+            for (const row of rows) {
+              const address = row['Dirección'] || row['Address'] || 'Sin dirección';
+              const price = parseFloat((row['Precio'] || row['Price'] || '0').toString().replace(/[$.]/g, '').replace(',', '.')) || 0;
+              const covered = parseFloat((row['Sup. Cubierta'] || row['Covered Surface'] || '0').toString()) || 0;
+              const uncovered = parseFloat((row['Sup. Descubierta'] || row['Uncovered Surface'] || '0').toString()) || 0;
+
+              const typeRaw = (row['Tipo Sup'] || row['Surface Type'] || '').trim();
+              const type = SURFACE_TYPES.includes(typeRaw as any) ? (typeRaw as SurfaceType) : 'Ninguno';
+
+              const factorRaw = parseFloat((row['Factor'] || '0').toString().replace(',', '.'));
+              const factor = !isNaN(factorRaw) ? factorRaw : DEFAULT_FACTORS[type];
+
+              const days = parseInt((row['Días'] || row['Days'] || '0').toString()) || 0;
+
+              if (address === 'Sin dirección' && price === 0) continue;
+
+              newComps.push({
+                address,
+                price,
+                coveredSurface: covered,
+                uncoveredSurface: uncovered,
+                surfaceType: type,
+                homogenizationFactor: factor,
+                daysOnMarket: days
+              });
+            }
+
+            // Replace existing or append? User said "traer los datos", usually implies sync/replace or append.
+            // Given "unify", let's replace for a clean sync state, or ask? 
+            // For now, let's append but maybe clear if empty? 
+            // Actually, let's just append to be safe, user can delete.
+
+            if (user && db) {
+              // Batch add would be better but keeping it simple
+              await Promise.all(newComps.map(c => addDoc(collection(db, `artifacts/tasadorpro/users/${user.uid}/comparables`), c)));
+            } else {
+              setComparables(prev => [...prev, ...newComps.map(c => ({ ...c, id: Math.random().toString() }))]);
+            }
+
+            addLog(`Successfully imported ${newComps.length} rows from Sheet`);
+          } catch (err: any) {
+            console.error("Parse Logic Error:", err);
+            alert(`Error processing data: ${err.message}`);
+          }
+        },
+        error: (err: any) => {
+          console.error("CSV Parse Error:", err);
+          alert("Error parsing Sheet data.");
+        }
+      });
+
+    } catch (error: any) {
+      console.error("Sheet Import Error:", error);
+      alert("Error importando desde Sheet. Asegúrate que esté configurada como 'Cualquiera con el enlace puede ver'.");
+    }
+  };
+
+  const handleExportToClipboard = () => {
+    try {
+      const data = comparables.map(c => ({
+        'ID': c.id,
+        'Dirección': c.address,
+        'Precio': c.price,
+        'Sup. Cubierta': c.coveredSurface,
+        'Sup. Descubierta': c.uncoveredSurface,
+        'Tipo Sup': c.surfaceType,
+        'Factor': c.homogenizationFactor,
+        'Días': c.daysOnMarket
+      }));
+
+      const csv = Papa.unparse(data, {
+        quotes: false, // TSV usually doesn't need quotes for Excel/Sheets paste unless special chars
+        delimiter: "\t", // Tab delimiter for copy-paste compatibility
+      });
+
+      navigator.clipboard.writeText(csv).then(() => {
+        alert("Datos copiados al portapapeles! \n\nVe a tu Google Sheet y presiona Ctrl+V para pegar.");
+        addLog("Data copied to clipboard");
+      }).catch(err => {
+        throw err;
+      });
+
+    } catch (error: any) {
+      console.error("Export Error:", error);
+      alert("Error copiando datos.");
+    }
+  };
+
+
+
+  // --- Saved Valuations Handlers ---
+
+  const handleNewValuation = async () => {
+    if (comparables.length > 0 || target.address) {
+      if (!confirm("¿Estás seguro de crear una nueva tasación? Se perderán los datos actuales no guardados.")) return;
+    }
+
+    const emptyTarget: TargetProperty = {
+      address: '',
+      coveredSurface: 0,
+      uncoveredSurface: 0,
+      surfaceType: 'Balcón',
+      homogenizationFactor: 0.10
+    };
+
+    setTarget(emptyTarget);
+    setComparables([]);
+
+    if (user && db) {
+      // Clear active data in Firestore
+      await setDoc(doc(db, `artifacts/tasadorpro/users/${user.uid}/data/valuation_active`), emptyTarget);
+
+      // Delete all active comparables
+      const compsRef = collection(db, `artifacts/tasadorpro/users/${user.uid}/comparables`);
+      const q = query(compsRef);
+      const snapshot = await getDocs(q);
+      const deletePromises = snapshot.docs.map(d => deleteDoc(d.ref));
+      await Promise.all(deletePromises);
+    }
+
+    addLog("Started new valuation");
+  };
+
+  const handleSaveValuation = async () => {
+    if (!user || !db) {
+      alert("Debes estar conectado para guardar.");
+      return;
+    }
+
+    if (savedValuations.length >= 30) {
+      alert("Has alcanzado el límite de 30 tasaciones guardadas. Elimina alguna para continuar.");
+      return;
+    }
+
+    if (!target.address) {
+      alert("Ingresa una dirección para la propiedad objetivo antes de guardar.");
+      return;
+    }
+
+    try {
+      const newValuation: Omit<SavedValuation, 'id'> = {
+        name: `${target.address} - ${new Date().toLocaleDateString()}`,
+        date: Date.now(),
+        target: target,
+        comparables: comparables
+      };
+
+      await addDoc(collection(db, `artifacts/tasadorpro/users/${user.uid}/saved_valuations`), newValuation);
+      addLog("Valuation saved successfully");
+      alert("Tasación guardada correctamente.");
+    } catch (error: any) {
+      console.error("Save Error:", error);
+      alert("Error al guardar tasación.");
+    }
+  };
+
+  const handleDeleteValuation = async (id: string) => {
+    if (!user || !db) return;
+    if (!confirm("¿Estás seguro de eliminar esta tasación?")) return;
+
+    try {
+      await deleteDoc(doc(db, `artifacts/tasadorpro/users/${user.uid}/saved_valuations`, id));
+      addLog("Valuation deleted");
+    } catch (error: any) {
+      console.error("Delete Error:", error);
+      alert("Error al eliminar.");
+    }
+  };
+
+  const handleLoadValuation = async (valuation: SavedValuation) => {
+    if (!confirm("Cargar esta tasación reemplazará los datos actuales. ¿Continuar?")) return;
+
+    try {
+      // Update local state
+      setTarget(valuation.target);
+      setComparables(valuation.comparables);
+
+      // Update Firestore Active Data (optional but good for persistence)
+      if (user && db) {
+        await setDoc(doc(db, `artifacts/tasadorpro/users/${user.uid}/data/valuation_active`), valuation.target, { merge: true });
+
+        // Replace comparables collection? That's expensive (delete all, add all). 
+        // For simplicity, let's just update local state and maybe warn user that "Active" DB might be out of sync if they refresh?
+        // Actually, the requirement is just to load it. 
+        // Ideally we should sync it. Let's try to sync by deleting current active comps and adding new ones.
+        // But that might be too many writes. 
+        // Let's just update local state for now and let the user "Save" again if they want to persist this state as "Active".
+        // Wait, if I update local state, the `onSnapshot` might override it if I don't update DB.
+        // Yes, `onSnapshot` will fire and reset state if I don't update DB.
+        // So I MUST update DB.
+
+        // Strategy: 
+        // 1. Update Target (easy)
+        // 2. Delete all current comparables in DB
+        // 3. Add all new comparables to DB
+
+        const compsRef = collection(db, `artifacts/tasadorpro/users/${user.uid}/comparables`);
+        const q = query(compsRef);
+        const snapshot = await getDocs(q); // Need getDocs import
+        const deletePromises = snapshot.docs.map(d => deleteDoc(d.ref));
+        await Promise.all(deletePromises);
+
+        const addPromises = valuation.comparables.map(c => addDoc(compsRef, c));
+        await Promise.all(addPromises);
+      }
+
+      setSavedValuationsModalOpen(false);
+      addLog("Valuation loaded");
+    } catch (error: any) {
+      console.error("Load Error:", error);
+      alert("Error al cargar tasación.");
+    }
   };
 
   // --- Calculations ---
@@ -361,7 +584,7 @@ function App() {
               <Calculator className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-violet-600">
-              TasadorPro
+              TTasaciones
             </h1>
           </div>
 
@@ -370,19 +593,77 @@ function App() {
               <FileSpreadsheet className="w-4 h-4 text-slate-500" />
               <input
                 type="text"
+                value={sheetUrl}
+                onChange={(e) => setSheetUrl(e.target.value)}
                 placeholder="Pegar link de Google Sheet..."
-                className="bg-transparent border-none focus:ring-0 text-sm w-64 text-slate-600 placeholder:text-slate-400"
+                className="bg-transparent border-none focus:ring-0 text-sm w-48 text-slate-600 placeholder:text-slate-400"
               />
             </div>
-            <button onClick={() => setImportModalOpen(true)} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-lg transition-colors">
+            <button onClick={handleNewValuation} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-lg transition-colors">
+              <Plus className="w-4 h-4" /> Nueva
+            </button>
+            <button onClick={() => setSavedValuationsModalOpen(true)} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-lg transition-colors">
+              <FolderOpen className="w-4 h-4" /> Mis Tasaciones
+            </button>
+            <button onClick={handleSaveValuation} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors">
+              <Save className="w-4 h-4" /> Guardar
+            </button>
+            <button onClick={handleImportFromSheet} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 rounded-lg transition-colors">
               <Upload className="w-4 h-4" /> Importar
             </button>
-            <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition-colors">
+            <button onClick={handleExportToClipboard} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg shadow-sm transition-colors">
               <Download className="w-4 h-4" /> Exportar
             </button>
           </div>
         </div>
       </header>
+
+      {/* Saved Valuations Modal */}
+      {savedValuationsModalOpen && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full p-6 flex flex-col max-h-[80vh]">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold text-slate-800">Mis Tasaciones Guardadas</h3>
+              <button onClick={() => setSavedValuationsModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-3 pr-2">
+              {savedValuations.length === 0 ? (
+                <div className="text-center py-10 text-slate-400">No tienes tasaciones guardadas.</div>
+              ) : (
+                savedValuations.map(val => (
+                  <div key={val.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-lg border border-slate-100 hover:border-indigo-200 transition-colors">
+                    <div>
+                      <div className="font-medium text-slate-800">{val.name}</div>
+                      <div className="text-xs text-slate-500">{new Date(val.date).toLocaleString()} • {val.comparables.length} comparables</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleLoadValuation(val)}
+                        className="px-3 py-1.5 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-md transition-colors"
+                      >
+                        Cargar
+                      </button>
+                      <button
+                        onClick={() => handleDeleteValuation(val.id)}
+                        className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-md transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="mt-6 pt-4 border-t border-slate-100 text-right text-xs text-slate-400">
+              {savedValuations.length} / 30 guardadas
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-7xl mx-auto px-4 py-8 space-y-8">
 
@@ -512,7 +793,8 @@ function App() {
                     <tr>
                       <th className="px-4 py-3 font-medium">Dirección</th>
                       <th className="px-4 py-3 font-medium text-right">Precio</th>
-                      <th className="px-4 py-3 font-medium text-center">Sup.</th>
+                      <th className="px-4 py-3 font-medium text-center">Sup. Cub</th>
+                      <th className="px-4 py-3 font-medium text-center">Sup. Desc</th>
                       <th className="px-4 py-3 font-medium">Tipo</th>
                       <th className="px-4 py-3 font-medium w-24">Factor</th>
                       <th className="px-4 py-3 font-medium text-right">$/m² H</th>
@@ -544,10 +826,20 @@ function App() {
                           />
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <div className="flex flex-col text-xs">
-                            <span>C: {comp.coveredSurface}</span>
-                            <span className="text-slate-400">D: {comp.uncoveredSurface}</span>
-                          </div>
+                          <input
+                            type="number"
+                            value={comp.coveredSurface}
+                            onChange={e => updateComparable(comp.id, { coveredSurface: parseFloat(e.target.value) || 0 })}
+                            className="bg-transparent border-none p-0 w-16 text-center focus:ring-0 text-slate-600"
+                          />
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          <input
+                            type="number"
+                            value={comp.uncoveredSurface}
+                            onChange={e => updateComparable(comp.id, { uncoveredSurface: parseFloat(e.target.value) || 0 })}
+                            className="bg-transparent border-none p-0 w-16 text-center focus:ring-0 text-slate-600"
+                          />
                         </td>
                         <td className="px-4 py-3">
                           <select
@@ -619,7 +911,7 @@ function App() {
               {/* Placeholder for Regression or Distribution - Using a simple LineChart for trend if enough data */}
               {processedComparables.length > 2 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={processedComparables.sort((a, b) => a.hPrice - b.hPrice)}>
+                  <LineChart data={[...processedComparables].sort((a, b) => a.hPrice - b.hPrice)}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                     <XAxis dataKey="address" hide />
                     <YAxis stroke="#94a3b8" fontSize={12} domain={['auto', 'auto']} />
@@ -640,30 +932,7 @@ function App() {
 
       </main>
 
-      {/* Import Modal */}
-      {importModalOpen && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full p-6 space-y-4">
-            <h3 className="text-lg font-bold text-slate-800">Importar CSV</h3>
-            <p className="text-sm text-slate-500">
-              Pega el contenido de tu CSV aquí. El orden esperado de columnas es: <br />
-              <code className="bg-slate-100 px-1 rounded">Ignorar, Dirección, Precio, SupCub, SupDesc, Tipo, Factor, Días</code>
-            </p>
-            <textarea
-              value={csvText}
-              onChange={e => setCsvText(e.target.value)}
-              className="w-full h-64 bg-slate-50 border-slate-200 rounded-lg p-4 font-mono text-xs focus:ring-indigo-500 focus:border-indigo-500"
-              placeholder="Pegar datos aquí..."
-            />
-            <div className="flex justify-end gap-3">
-              <button onClick={() => setImportModalOpen(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">Cancelar</button>
-              <button onClick={handleImportCSV} className="px-4 py-2 bg-indigo-600 text-white hover:bg-indigo-700 rounded-lg transition-colors">Procesar Importación</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
-
 export default App;
