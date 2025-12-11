@@ -3,13 +3,13 @@ import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore, enableIndexedDbPersistence } from 'firebase/firestore';
 
 const firebaseConfig = {
-    apiKey: "AIzaSyCxlL7R7wke6VKnU-GysFi4dl76_0hApZ4",
-    authDomain: "ttasaciones-5ce4d.firebaseapp.com",
-    projectId: "ttasaciones-5ce4d",
-    storageBucket: "ttasaciones-5ce4d.firebasestorage.app",
-    messagingSenderId: "779321924202",
-    appId: "1:779321924202:web:809fcfd276dfc2b3c98813",
-    measurementId: "G-P1TSNB7NNZ"
+    apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+    authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+    projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+    storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+    appId: import.meta.env.VITE_FIREBASE_APP_ID,
+    measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
 let db: any;
